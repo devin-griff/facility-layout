@@ -479,21 +479,87 @@ def _connectivity(blocks, pairs):
     return conn
 
 
+def _pipe_segments(block_i, block_j):
+    """Compute the two L-shape segments routing from block i's perimeter to
+    block j's perimeter, using edge-port routing.
+
+    Routing convention:
+      1. Determine the dominant axis between block centers (|dx| vs |dy|).
+      2. Source uses the edge-midpoint port on its dominant-axis side
+         facing j; destination uses the opposite-axis-side port facing i.
+         This naturally spreads pipes around blocks (right port for pipes
+         coming from the right, top port for pipes from above, etc.).
+      3. Bend the L-shape so the first leg runs along the dominant axis
+         leaving the source port — the natural "exit" direction.
+
+    Returns a list of two segments, each as a dict with keys
+    {"x", "y", "x2", "y2"}.
+    """
+    cx_i = block_i["x"] + block_i["l"] / 2
+    cy_i = block_i["y"] + block_i["w"] / 2
+    cx_j = block_j["x"] + block_j["l"] / 2
+    cy_j = block_j["y"] + block_j["w"] / 2
+    dx = cx_j - cx_i
+    dy = cy_j - cy_i
+
+    if abs(dx) >= abs(dy):
+        # Horizontal-dominant. Use right/left edge midpoints.
+        if dx >= 0:
+            src = (block_i["x"] + block_i["l"], cy_i)   # i's right edge
+            dst = (block_j["x"], cy_j)                  # j's left edge
+        else:
+            src = (block_i["x"], cy_i)                  # i's left edge
+            dst = (block_j["x"] + block_j["l"], cy_j)   # j's right edge
+        # Horizontal-first: leave source horizontally, then drop/rise.
+        bend = (dst[0], src[1])
+        return [
+            {"x": src[0], "y": src[1], "x2": bend[0], "y2": bend[1]},
+            {"x": bend[0], "y": bend[1], "x2": dst[0], "y2": dst[1]},
+        ]
+    else:
+        # Vertical-dominant. Use top/bottom edge midpoints.
+        if dy >= 0:
+            src = (cx_i, block_i["y"] + block_i["w"])   # i's top edge
+            dst = (cx_j, block_j["y"])                  # j's bottom edge
+        else:
+            src = (cx_i, block_i["y"])                  # i's bottom edge
+            dst = (cx_j, block_j["y"] + block_j["w"])   # j's top edge
+        # Vertical-first: leave source vertically, then traverse.
+        bend = (src[0], dst[1])
+        return [
+            {"x": src[0], "y": src[1], "x2": bend[0], "y2": bend[1]},
+            {"x": bend[0], "y": bend[1], "x2": dst[0], "y2": dst[1]},
+        ]
+
+
 def build_layout_chart(res):
     """Multi-layered Altair chart for the optimal layout.
 
-    Layers:
-      1. Pipe overlay (lines between block centers, opacity ∝ c_ij)
-      2. Block rectangles (color = connectivity)
-      3. Block-id labels at centers
-      4. Outer facility bounding box (dashed)
+    Layers (back-to-front):
+      1. Outer facility bounding box (dashed)
+      2. Pipe overlay — L-shaped paths via edge-port routing, opacity ∝ c_ij,
+         linked-hover dims non-hovered pipes
+      3. Block rectangles (fill = connectivity), border highlights orange
+         when a pipe connecting this block is hovered
+      4. Block-id labels at centers
     """
     blocks = res["blocks"]
     pairs = res["pairs"]
     l_f, w_f = res["facility"]
 
     conn = _connectivity(blocks, pairs)
-    # Block dataframe with center coordinates for the label and pipe layers.
+    blocks_by_id = {b["i"]: b for b in blocks}
+
+    # Adjacency map — for each block, the set of other blocks it's connected
+    # to via a non-zero-cost pipe. Embedded in df_blocks as a comma-delimited
+    # string (",2,3,5,") so the linked block-hover expression can test
+    # membership via `indexof(...)` in Vega.
+    adj = {b["i"]: set() for b in blocks}
+    for p in pairs:
+        if p["c"] > 0:
+            adj[p["i"]].add(p["j"])
+            adj[p["j"]].add(p["i"])
+
     df_blocks = pd.DataFrame([{
         "i":   b["i"],
         "x":   b["x"],
@@ -506,33 +572,88 @@ def build_layout_chart(res):
         "w":   b["w"],
         "rotated": "yes" if b["rotated"] else "no",
         "connectivity": conn[b["i"]],
+        "connected_str": "," + ",".join(str(x) for x in sorted(adj[b["i"]])) + ",",
     } for b in blocks])
 
-    # Layer 1 — pipe overlay. Build a row per pair with the centers of i and j
-    # and the cost. Opacity scales 0..1 with c / max_c.
+    # Pipe dataframe — edge-port-routed L-shapes, two segments per pair.
+    # Includes integer i_id/j_id columns so the linked-hover selection can
+    # match against block IDs (the `pair` string is for the tooltip only).
     max_c = max((p["c"] for p in pairs), default=0.0)
     if max_c > 0:
         pipe_rows = []
-        center = {b["i"]: (b["x"] + b["l"] / 2, b["y"] + b["w"] / 2) for b in blocks}
         for p in pairs:
             if p["c"] <= 0:
                 continue
-            xi, yi = center[p["i"]]
-            xj, yj = center[p["j"]]
-            pipe_rows.append({"x": xi, "y": yi, "x2": xj, "y2": yj,
-                              "c": p["c"], "pair": f"{p['i']}—{p['j']}"})
+            seg_a, seg_b = _pipe_segments(blocks_by_id[p["i"]], blocks_by_id[p["j"]])
+            pair_label = f"{p['i']}—{p['j']}"
+            for seg in (seg_a, seg_b):
+                pipe_rows.append({
+                    **seg,
+                    "c": p["c"],
+                    "pair": pair_label,
+                    "i_id": int(p["i"]),
+                    "j_id": int(p["j"]),
+                })
         df_pipes = pd.DataFrame(pipe_rows)
     else:
-        df_pipes = pd.DataFrame(columns=["x", "y", "x2", "y2", "c", "pair"])
+        df_pipes = pd.DataFrame(
+            columns=["x", "y", "x2", "y2", "c", "pair", "i_id", "j_id"]
+        )
 
-    # Domain spans (with a small padding) so the facility bounding box and
-    # all blocks fit comfortably without clipping.
+    # Domain spans with padding so nothing clips at the edges.
     pad = 0.05 * max(l_f, w_f, 1.0)
     x_dom = [-pad, l_f + pad]
     y_dom = [-pad, w_f + pad]
 
-    # Outer facility bounding box (single-row dataframe for the rect layer).
     df_facility = pd.DataFrame([{"x": 0, "y": 0, "x2": l_f, "y2": w_f}])
+
+    # ── Linked-hover selections ───────────────────────────────────────────
+    # Two parallel selections: one bound to the pipe layer (`hover`), one to
+    # the block layer (`block_hover`). They use different fields and feed
+    # the same set of conditional expressions on each layer, so hovering
+    # either a pipe OR a block produces the matched highlight pattern.
+    #
+    # `empty=True` is harmless here — we drive everything from explicit
+    # `length(... || []) > 0` checks in the expressions below, so the
+    # `empty` interpretation never affects the visible result.
+    #
+    # `nearest=False` (omitted) means the cursor must be directly on the
+    # mark to trigger selection. No snap-from-afar.
+    hover = alt.selection_point(
+        name="hover",
+        on="mouseover",
+        fields=["i_id", "j_id"],
+        empty=True,
+    )
+    block_hover = alt.selection_point(
+        name="block_hover",
+        on="mouseover",
+        fields=["i"],
+        empty=True,
+    )
+
+    # Pipe is bright if:
+    #   - both selections are empty (default state),         OR
+    #   - this pipe is the hovered pipe (pipe-hover match),  OR
+    #   - this pipe touches the hovered block (block-hover match).
+    pipe_opacity_expr = (
+        "(length(hover.i_id || []) === 0 && length(block_hover.i || []) === 0)"
+        " || (length(hover.i_id || []) > 0 && datum.i_id === hover.i_id[0]"
+        "     && datum.j_id === hover.j_id[0])"
+        " || (length(block_hover.i || []) > 0 && (datum.i_id === block_hover.i[0]"
+        "     || datum.j_id === block_hover.i[0]))"
+    )
+
+    # Block is highlighted if:
+    #   - it's an endpoint of the hovered pipe,              OR
+    #   - it IS the hovered block,                           OR
+    #   - it's connected to the hovered block (via adj str).
+    block_stroke_expr = (
+        "(length(hover.i_id || []) > 0 && (datum.i === hover.i_id[0]"
+        "     || datum.i === hover.j_id[0]))"
+        " || (length(block_hover.i || []) > 0 && (datum.i === block_hover.i[0]"
+        "     || indexof(datum.connected_str, ',' + toString(block_hover.i[0]) + ',') >= 0))"
+    )
 
     # ── Build the chart layers ────────────────────────────────────────────
     base = alt.Chart(df_blocks).encode(
@@ -540,7 +661,6 @@ def build_layout_chart(res):
         y=alt.Y("y:Q", scale=alt.Scale(domain=y_dom), title="y"),
     )
 
-    # Facility bounding box — dashed outline, no fill.
     facility_box = alt.Chart(df_facility).mark_rect(
         fill=None, stroke="#374151", strokeWidth=1.5, strokeDash=[6, 4],
     ).encode(
@@ -550,14 +670,26 @@ def build_layout_chart(res):
         y2="y2:Q",
     )
 
-    # Block rectangles — fill colored by connectivity.
-    block_rects = base.mark_rect(
-        stroke="#1f2937", strokeWidth=1.5,
-    ).encode(
+    # Block rectangles — stroke color/width are conditional on either the
+    # pipe-hover or the block-hover selection. The block layer hosts the
+    # block_hover param; the expression also references the pipe `hover`
+    # selection (which lives on the pipe layer) so a single pipe-hover
+    # also lights up its endpoint blocks.
+    block_rects = base.mark_rect().encode(
         x="x:Q", y="y:Q", x2="x2:Q", y2="y2:Q",
         color=alt.Color("connectivity:Q",
                         scale=alt.Scale(scheme="blues"),
                         legend=alt.Legend(title="Pipe connectivity")),
+        stroke=alt.condition(
+            block_stroke_expr,
+            alt.value("#f59e0b"),       # orange highlight
+            alt.value("#1f2937"),        # default dark border
+        ),
+        strokeWidth=alt.condition(
+            block_stroke_expr,
+            alt.value(3.5),
+            alt.value(1.5),
+        ),
         tooltip=[
             alt.Tooltip("i:O", title="Block"),
             alt.Tooltip("x:Q", format=".2f", title="x (lower-left)"),
@@ -567,28 +699,42 @@ def build_layout_chart(res):
             alt.Tooltip("rotated:N", title="Rotated"),
             alt.Tooltip("connectivity:Q", format=".2f", title="Σ pipe cost"),
         ],
-    )
+    ).add_params(block_hover)
 
-    # Block labels at centers.
     block_labels = alt.Chart(df_blocks).mark_text(
         fontSize=14, fontWeight="bold", color="#0a0a4e",
     ).encode(
         x="cx:Q", y="cy:Q", text="i:O",
     )
 
-    # Pipe overlay — drawn first (below blocks) so block fills sit on top.
-    pipe_lines = alt.Chart(df_pipes).mark_rule(
-        stroke="#dc2626",
-    ).encode(
-        x="x:Q", y="y:Q", x2="x2:Q", y2="y2:Q",
-        size=alt.Size("c:Q", scale=alt.Scale(range=[0.5, 4]),
-                      legend=alt.Legend(title="Pipe cost")),
-        opacity=alt.Opacity("c:Q", scale=alt.Scale(range=[0.25, 0.85])),
-        tooltip=[
-            alt.Tooltip("pair:N", title="Pair"),
-            alt.Tooltip("c:Q", format=".2f", title="Pipe cost"),
-        ],
-    ) if len(df_pipes) else alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_rule()
+    # Pipe overlay — two co-located layers. The visible layer is a thin
+    # color rule with size proportional to pipe cost; the hit-target is a
+    # transparent wider rule that captures the hover event and shows the
+    # tooltip. Decoupling them lets us keep pipes visually thin while
+    # giving the cursor a more forgiving hit zone.
+    if len(df_pipes):
+        visible_pipes = alt.Chart(df_pipes).mark_rule(
+            stroke="#dc2626",
+        ).encode(
+            x="x:Q", y="y:Q", x2="x2:Q", y2="y2:Q",
+            size=alt.Size("c:Q",
+                          scale=alt.Scale(range=[0.5, 4]),
+                          legend=alt.Legend(title="Pipe cost")),
+            opacity=alt.condition(pipe_opacity_expr, alt.value(0.9), alt.value(0.25)),
+        )
+        pipe_hit_targets = alt.Chart(df_pipes).mark_rule(
+            stroke="transparent",
+            strokeWidth=8,
+        ).encode(
+            x="x:Q", y="y:Q", x2="x2:Q", y2="y2:Q",
+            tooltip=[
+                alt.Tooltip("pair:N", title="Pair (i—j)"),
+                alt.Tooltip("c:Q", format=".2f", title="Pipe cost"),
+            ],
+        ).add_params(hover)
+        pipe_lines = alt.layer(visible_pipes, pipe_hit_targets)
+    else:
+        pipe_lines = alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_rule()
 
     chart = (
         alt.layer(facility_box, pipe_lines, block_rects, block_labels)
