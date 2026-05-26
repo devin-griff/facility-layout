@@ -931,12 +931,12 @@ distances if the solver returns infeasible.
 [1] L. G. Papageorgiou and G. E. Rotstein, "Continuous-Domain
 Mathematical Models for Optimal Process Plant Layout," *Industrial &
 Engineering Chemistry Research*, vol. 37, no. 9, pp. 3631–3639, 1998.
-[doi:10.1021/ie980146v](https://doi.org/10.1021/ie980146v)
+[ACS](https://pubs.acs.org/doi/10.1021/ie980146v)
 
 [2] P. M. Castro, I. E. Grossmann, and A. Q. Novais, "Two New Continuous-Time
 Models for the Scheduling of Multistage Batch Plants with Sequence-Dependent
 Changeovers," *Computers & Chemical Engineering*, 2005.
-[doi:10.1016/j.compchemeng.2005.06.005](https://doi.org/10.1016/j.compchemeng.2005.06.005)
+[ScienceDirect](https://doi.org/10.1016/j.compchemeng.2005.06.005)
 
 [3] H. D. Sherali and J. C. Smith, "Improving discrete model
 representations via symmetry considerations," *Management Science*,
@@ -945,6 +945,12 @@ vol. 47, no. 10, pp. 1396–1407, 2001.
 [4] L. T. Biegler, *Nonlinear Programming: Concepts, Algorithms, and
 Applications to Chemical Processes*, SIAM, 2010 (background on the
 disjunctive-programming approach).
+
+[5] M. L. Bynum, G. A. Hackebeil, W. E. Hart, C. D. Laird,
+B. L. Nicholson, J. D. Siirola, J.-P. Watson, and D. L. Woodruff,
+*Pyomo — Optimization Modeling in Python*, 3rd ed. Cham: Springer,
+2021.
+[Springer](https://link.springer.com/book/10.1007/978-3-030-68928-5)
 """)
 
 
