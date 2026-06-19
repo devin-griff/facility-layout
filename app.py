@@ -149,8 +149,13 @@ MIN_OBJECTS = 2            # rack + ≥1 object (sym_1/sym_2 reference block 2)
 
 DIM_MIN, DIM_MAX = 1, 9    # editable length / width range
 DIM_RAND_MAX = 3           # Randomize draws dimensions from [1, 3]
-COST_MIN, COST_MAX = 0, 9  # editable pipe-cost-to-rack range
+COST_MIN, COST_MAX = 1, 9  # editable pipe-cost-to-rack range (every object pipes to the rack)
 COST_RAND_MAX = 3          # Randomize draws costs from [1, 3]
+
+# Weight on the facility bounding box (l_f + w_f) relative to the cost-weighted
+# piping in the objective. The two terms are not in the same natural units, so
+# this is the size-vs-piping knob. Default 1, no UI control.
+FOOTPRINT_WEIGHT = 1.0
 
 # The rack (object 1) spans the facility length: fixed long-and-thin dims, and
 # always the longest object so every instance stays feasible. Reset and
@@ -385,7 +390,7 @@ def build_model(n, l0, w0, cmat, d_uniform, rotate, sym):
 
     # Objective: minimize facility size + Σ pipe-weighted Manhattan distances.
     m.obj = pyo.Objective(
-        expr=m.l_f + m.w_f
+        expr=FOOTPRINT_WEIGHT * (m.l_f + m.w_f)
              + sum(m.c[i, j] * (m.dx[i, j] + m.dy[i, j]) for i, j in m.p),
         sense=pyo.minimize,
     )
@@ -1232,7 +1237,9 @@ Place $n$ rectangular objects so that the facility's bounding-box
 dimensions plus the cost-weighted Manhattan pipe distances to the rack are
 minimized. Width is the horizontal ($x$) axis, length the vertical ($y$):
 
-$$\min \; l_f + w_f + \sum_{i,j \in N,\; j<i} c_{ij} \big( dx_{ij} + dy_{ij} \big)$$
+$$\min \; \lambda \,(l_f + w_f) + \sum_{i,j \in N,\; j<i} c_{ij} \big( dx_{ij} + dy_{ij} \big)$$
+
+where $\lambda$ weights the facility size against the piping cost (default 1).
 
 subject to the facility containing every object (length along $y$, width
 along $x$):
