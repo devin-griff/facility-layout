@@ -169,6 +169,13 @@ D_MIN, D_MAX, D_DEFAULT = 0, 3, 1
 # Time-limit presets for the inline radio (label → seconds).
 _TIME_LIMITS = {"10 s": 10, "30 s": 30, "60 s": 60}
 
+# Solution pool: ask Gurobi for the best POOL_SIZE feasible layouts, then show up
+# to MAX_SOLUTIONS distinct ones in the layout selector. The degeneracy
+# breaking constraint in build_model is what makes pooled solutions distinct
+# physical layouts rather than duplicate indicator encodings of one layout.
+POOL_SIZE = 20      # candidates pulled from Gurobi's pool before diverse pick
+MAX_SOLUTIONS = 5   # distinct layouts shown in the selector
+
 # RNG seed for Randomize; bumped each click for a fresh instance.
 DEFAULT_SEED = 1
 
@@ -395,18 +402,29 @@ def build_model(n, l0, w0, cmat, d_uniform, rotate, sym):
         sense=pyo.minimize,
     )
 
-    # Non-overlap GDP: 4-way disjunction per pair. Each disjunct is a single
-    # inequality forcing one spatial relation with the minimum separation d
-    # baked in. Distance is handled by the global dx/dy constraints above, so
-    # these decide only feasibility (which pairs are separated, on which
-    # axis) — never the objective.
+    # Non-overlap GDP: 4-way disjunction per pair, one spatial relation each
+    # with the minimum separation d baked in. Distance is handled by the global
+    # dx/dy constraints above, so these decide only feasibility (which pairs are
+    # separated, on which axis), never the objective.
+    #
+    # Degeneracy breaking constraint (d-aware Trespalacios & Grossmann): the
+    # left/right disjuncts additionally require the blocks to overlap vertically
+    # within d-1. A diagonally separated pair then has a vertical gap >= d, so it
+    # can only route through above/below, giving one encoding per physical
+    # layout. Without this, a pair separated on both axes has two valid
+    # encodings, and the solution pool fills with duplicate encodings of the
+    # same layout. The constraint is optimum-preserving (every layout keeps a
+    # valid encoding) and needs integer d, which the integer min-distance
+    # stepper guarantees.
     @m.Disjunction(m.p)
     def no_overlap(m, i, j):
+        vov = [m.y[i] + m.l[i] >= m.y[j] - (m.d[i, j] - 1),
+               m.y[j] + m.l[j] >= m.y[i] - (m.d[i, j] - 1)]
         return [
-            [m.x[i] + m.w[i] + m.d[i, j] <= m.x[j]],   # i left of j
-            [m.x[j] + m.w[j] + m.d[i, j] <= m.x[i]],   # i right of j
-            [m.y[i] + m.l[i] + m.d[i, j] <= m.y[j]],   # i below j
-            [m.y[j] + m.l[j] + m.d[i, j] <= m.y[i]],   # i above j
+            [m.x[i] + m.w[i] + m.d[i, j] <= m.x[j]] + vov,   # i left of j
+            [m.x[j] + m.w[j] + m.d[i, j] <= m.x[i]] + vov,   # i right of j
+            [m.y[i] + m.l[i] + m.d[i, j] <= m.y[j]],         # i below j
+            [m.y[j] + m.l[j] + m.d[i, j] <= m.y[i]],         # i above j
         ]
 
     # Rotation GDP (optional): 2-way disjunction per block — EXCEPT block 1
@@ -447,10 +465,12 @@ class _LicenseBusyError(RuntimeError):
     solve() maps this onto the `license_busy` status."""
 
 
-def _run_gurobi(m, time_limit):
+def _run_gurobi(m, time_limit, extract_fn, pool_size):
     """Solve the (already GDP-transformed) MILP via the NATIVE appsi
-    Gurobi interface, loading the solution onto `m` when one exists.
-    Returns (termination_condition, primal, dual, log).
+    Gurobi interface with the solution pool on, calling `extract_fn` once per
+    pooled solution (it reads the model while that solution is loaded) and
+    returning the list. Returns (termination_condition, primal, dual, log,
+    solutions).
 
     The native interface (not the legacy SolverFactory("appsi_gurobi"))
     is required: the legacy wrapper's symbol-map bookkeeping crashes on
@@ -464,7 +484,11 @@ def _run_gurobi(m, time_limit):
     opt.config.time_limit = float(time_limit)
     opt.config.load_solution = False
     opt.config.stream_solver = True  # log into the redirected stdout
+    # Solution pool: keep the best `pool_size` feasible solutions found.
+    opt.gurobi_options['PoolSearchMode'] = 2          # find the n best
+    opt.gurobi_options['PoolSolutions'] = int(pool_size)
     buf = io.StringIO()
+    sols = []
     try:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             for attempt in (1, 2):
@@ -480,7 +504,13 @@ def _run_gurobi(m, time_limit):
                         raise _LicenseBusyError(str(e)) from e
                     raise
             if res.best_feasible_objective is not None:
-                res.solution_loader.load_vars()
+                # Pull each pooled solution into a plain layout dict while the
+                # model is still loaded. load_vars(solution_number=k) switches
+                # Gurobi's active solution to pool member k (k=0 is the best).
+                n_pool = int(opt._solver_model.SolCount)
+                for k in range(min(n_pool, int(pool_size))):
+                    res.solution_loader.load_vars(solution_number=k)
+                    sols.append(extract_fn())
     finally:
         try:
             opt.release_license()
@@ -500,7 +530,89 @@ def _run_gurobi(m, time_limit):
         TerminationCondition, res.termination_condition.name,
         TerminationCondition.unknown,
     )
-    return tc, res.best_feasible_objective, res.best_objective_bound, log
+    return tc, res.best_feasible_objective, res.best_objective_bound, log, sols
+
+
+def _extract_layout(m, rotate, l0):
+    """Read the model's current solution into a plain layout dict (blocks, pipe
+    pairs, objective, facility size, total piping cost). Called once per pooled
+    solution, each time with a different pool member loaded onto the model."""
+    blocks = []
+    for i in m.n:
+        blocks.append({
+            "i": i,
+            "x": float(pyo.value(m.x[i])),
+            "y": float(pyo.value(m.y[i])),
+            "l": float(pyo.value(m.l[i])),
+            "w": float(pyo.value(m.w[i])),
+            "rotated": bool(rotate and abs(float(pyo.value(m.l[i])) - l0[i]) > 1e-6),
+        })
+    pairs = []
+    for (i, j) in m.p:
+        pairs.append({
+            "i": i, "j": j,
+            "c": float(pyo.value(m.c[i, j])),
+            "dx": float(pyo.value(m.dx[i, j])),
+            "dy": float(pyo.value(m.dy[i, j])),
+        })
+    return {
+        "blocks": blocks,
+        "pairs": pairs,
+        "obj": float(pyo.value(m.obj)),
+        "facility": (float(pyo.value(m.l_f)), float(pyo.value(m.w_f))),
+        "pipe_cost": sum(p["c"] * (p["dx"] + p["dy"]) for p in pairs),
+    }
+
+
+def _relation_vector(blocks):
+    """The spatial relation each block pair takes (left / right / below /
+    above), as a tuple over all pairs, derived from positions. Two layouts that
+    route many pairs differently are structurally different even at a similar
+    cost — so the count of differing entries is a translation-invariant
+    'how different are these two layouts' distance."""
+    bs = {b["i"]: b for b in blocks}
+    ids = sorted(bs)
+    tol = 1e-6
+    rels = []
+    for idx, i in enumerate(ids):
+        bi = bs[i]
+        for j in ids[:idx]:
+            bj = bs[j]
+            if bi["x"] + bi["w"] <= bj["x"] + tol:
+                rels.append(0)        # i left of j
+            elif bj["x"] + bj["w"] <= bi["x"] + tol:
+                rels.append(1)        # i right of j
+            elif bi["y"] + bi["l"] <= bj["y"] + tol:
+                rels.append(2)        # i below j
+            else:
+                rels.append(3)        # i above j
+    return tuple(rels)
+
+
+def _select_diverse(layouts, k):
+    """Greedily choose up to k layouts that are as different from each other as
+    possible: start from the cheapest, then repeatedly add the layout whose
+    nearest already-chosen layout is the most different (max-min over the
+    relation vectors). Spreads the picks out instead of clustering at the
+    cheap end."""
+    if len(layouts) <= k:
+        return list(layouts)
+    vecs = [_relation_vector(s["blocks"]) for s in layouts]
+
+    def dist(a, b):
+        return sum(1 for x, y in zip(vecs[a], vecs[b]) if x != y)
+
+    chosen = [0]   # layouts[0] is the cheapest (pool is best-first)
+    while len(chosen) < k:
+        nxt, best = None, -1
+        for c in range(len(layouts)):
+            if c in chosen:
+                continue
+            d = min(dist(c, s) for s in chosen)
+            if d > best:
+                best, nxt = d, c
+        chosen.append(nxt)
+    return [layouts[c] for c in chosen]
 
 
 def solve(n, l0, w0, cmat, d_uniform, rotate, sym, time_limit):
@@ -512,7 +624,8 @@ def solve(n, l0, w0, cmat, d_uniform, rotate, sym, time_limit):
     pyo.TransformationFactory("gdp.bigm").apply_to(m)
 
     try:
-        tc, primal, dual, log = _run_gurobi(m, time_limit)
+        tc, primal, dual, log, raw_sols = _run_gurobi(
+            m, time_limit, lambda: _extract_layout(m, rotate, l0), POOL_SIZE)
     except _LicenseBusyError:
         return {
             "status": "license_busy",
@@ -553,48 +666,44 @@ def solve(n, l0, w0, cmat, d_uniform, rotate, sym, time_limit):
     if status not in ("optimal", "incumbent"):
         return {"status": status, "log": log}
 
-    # Pull values out for the UI.
-    blocks = []
-    for i in m.n:
-        blocks.append({
-            "i": i,
-            "x": float(pyo.value(m.x[i])),
-            "y": float(pyo.value(m.y[i])),
-            "l": float(pyo.value(m.l[i])),
-            "w": float(pyo.value(m.w[i])),
-            "rotated": bool(rotate and abs(float(pyo.value(m.l[i])) - l0[i]) > 1e-6),
-        })
+    # Dedup the pooled layouts by block geometry, then pick a spread of
+    # MAX_SOLUTIONS that are as structurally different as possible (greedy
+    # max-min over each pair's spatial relation), and order the chosen set by
+    # cost. The pool returns the cheapest layouts, which tend to cluster;
+    # selecting for difference surfaces genuinely distinct arrangements (at a
+    # somewhat higher cost for the alternatives).
+    seen = set()
+    distinct = []
+    for s in raw_sols:
+        fp = tuple((b["i"], round(b["x"], 3), round(b["y"], 3),
+                    round(b["w"], 3), round(b["l"], 3)) for b in s["blocks"])
+        if fp in seen:
+            continue
+        seen.add(fp)
+        distinct.append(s)
+    solutions = _select_diverse(distinct, MAX_SOLUTIONS)
+    solutions.sort(key=lambda s: s["obj"])
 
-    pairs = []
-    for (i, j) in m.p:
-        pairs.append({
-            "i": i, "j": j,
-            "c": float(pyo.value(m.c[i, j])),
-            "dx": float(pyo.value(m.dx[i, j])),
-            "dy": float(pyo.value(m.dy[i, j])),
-        })
+    if not solutions:
+        # Termination says feasible but nothing came back — treat as no usable
+        # layout rather than crash the UI.
+        return {"status": "no_feasible", "log": log}
 
-    # Result-level summary numbers for the status banner.
-    obj = float(pyo.value(m.obj))
-    facility = (float(pyo.value(m.l_f)), float(pyo.value(m.w_f)))
-    pipe_cost = sum(p["c"] * (p["dx"] + p["dy"]) for p in pairs)
-
-    # Best-known bound (Gurobi's dual bound) for gap reporting on the
-    # incumbent path.
+    # Optimality gap is a property of the run: best objective vs Gurobi's dual
+    # bound. It stays constant across the pooled alternatives.
+    best_obj = solutions[0]["obj"]
     lower_bound = dual if (dual is not None and dual != float("-inf")
                            and dual == dual) else None
-
     gap = None
-    if lower_bound is not None and lower_bound > 0 and obj > 0:
-        gap = max(0.0, (obj - lower_bound) / max(abs(obj), 1e-12))
+    if lower_bound is not None and lower_bound > 0 and best_obj > 0:
+        gap = max(0.0, (best_obj - lower_bound) / max(abs(best_obj), 1e-12))
 
     return {
         "status": status,
-        "blocks": blocks,
-        "pairs": pairs,
-        "obj": obj,
-        "facility": facility,
-        "pipe_cost": pipe_cost,
+        "solutions": solutions,
+        # Best layout's fields also at top level, so any consumer reading
+        # res["blocks"]/["facility"]/etc. still gets the headline solution.
+        **solutions[0],
         "lower_bound": lower_bound,
         "gap": gap,
         "elapsed": time.time() - t0,
@@ -891,7 +1000,12 @@ def build_layout_chart(res):
     # the data scale; the light plate keeps the label legible over the blocks.
     if res.get("status") == "preview":
         _one = pd.DataFrame([{"_": 0}])
-        _bx, _by = _w_px / 2.0, 24.0
+        # Center the badge vertically between the top of the plot and the dashed
+        # facility-top line. That line sits `pad` data-units below the plot top,
+        # so it's `_dash_px` pixels down; the badge goes at half that.
+        _dash_px = _h_px * pad / (y_dom[1] - y_dom[0])
+        _bx = _w_px / 2.0
+        _by = max(14.0, _dash_px / 2.0)
         plate = alt.Chart(_one).mark_rect(
             fill="white", fillOpacity=0.85, stroke="#9ca3af",
             strokeWidth=1, cornerRadius=6,
@@ -1123,40 +1237,53 @@ def render_optimizer(ss):
         _render_object_editor(ss)
 
     with viz_col:
-        # Everything in one row (strip-packing layout): Solve / Min distance /
-        # Rotation / Time limit, then the five metric slots. The layout paints
-        # below through a placeholder so the controls commit before we draw.
-        top = st.columns(
-            [0.7, 1.5, 1.2, 1.9, 1.0, 1.0, 1.1, 0.9, 1.0],
-            vertical_alignment="bottom",
+        _viz_panel(ss)
+
+
+@st.fragment
+def _viz_panel(ss):
+    """Result panel — controls, layout selector, chart, metrics — isolated in a
+    fragment. The Solve/option controls and the layout selector live here, so
+    interacting with any of them re-renders only this panel, not the object
+    editor or the Formulation/Logs tabs. All pooled layouts are already computed
+    and cached in session_state, so switching the selector just redraws the
+    chart — no re-solve and no full-app rerun."""
+    # Everything in one row (strip-packing layout): Solve / Min distance /
+    # Rotation / Time limit, then the five metric slots. The layout paints
+    # below through a placeholder so the controls commit before we draw.
+    top = st.columns(
+        [0.7, 1.5, 1.2, 1.9, 1.0, 1.0, 1.1, 0.9, 1.0],
+        vertical_alignment="bottom",
+    )
+    with top[0]:
+        solve_clicked = st.button("Solve", type="primary",
+                                  use_container_width=True)
+    with top[1]:
+        d_min = st.number_input(
+            "Min distance", min_value=D_MIN, max_value=D_MAX, step=1,
+            value=int(ss["d_min"]), key="dmin_input",
+            on_change=_clear_solution,
         )
-        with top[0]:
-            solve_clicked = st.button("Solve", type="primary",
-                                      use_container_width=True)
-        with top[1]:
-            d_min = st.number_input(
-                "Min distance", min_value=D_MIN, max_value=D_MAX, step=1,
-                value=int(ss["d_min"]), key="dmin_input",
-                on_change=_clear_solution,
-            )
-        with top[2]:
-            rotate = st.checkbox("Rotation", value=ss["rotate"],
-                                 key="rotate_box", on_change=_clear_solution)
-        with top[3]:
-            time_label = st.radio(
-                "Time limit", options=list(_TIME_LIMITS.keys()), index=0,
-                horizontal=True, key="time_radio",
-                on_change=_clear_solution,
-            )
-        facL_slot = top[4].empty()
-        facW_slot = top[5].empty()
-        pipe_slot = top[6].empty()
-        gap_slot = top[7].empty()
-        time_slot = top[8].empty()
-        # Spacer so the plot sits a little below the controls/metrics row.
-        st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
-        viz_slot = st.empty()
-        spinner_slot = st.empty()
+    with top[2]:
+        rotate = st.checkbox("Rotation", value=ss["rotate"],
+                             key="rotate_box", on_change=_clear_solution)
+    with top[3]:
+        time_label = st.radio(
+            "Time limit", options=list(_TIME_LIMITS.keys()), index=0,
+            horizontal=True, key="time_radio",
+            on_change=_clear_solution,
+        )
+    # Metric columns (4-8) are filled at the end, once the selected solution is
+    # known. They render straight into the columns (not via st.empty
+    # placeholders) so a toggle change updates the numbers in place instead of
+    # blanking and repainting them.
+    # Spacer so the plot sits a little below the controls/metrics row.
+    st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
+    # Layout selector — filled later, only when a solve returned more than
+    # one distinct layout. Sits directly above the plot, below the controls.
+    toggle_slot = st.empty()
+    viz_slot = st.empty()
+    spinner_slot = st.empty()
 
     ss["d_min"] = int(d_min)
     ss["rotate"] = bool(rotate)
@@ -1171,26 +1298,64 @@ def render_optimizer(ss):
                 ss["res"] = solve(n, l0, w0, cmat, float(ss["d_min"]),
                                   ss["rotate"], 1, time_limit)
         spinner_slot.empty()
+        ss["sol_sel"] = 0   # reset the layout selector to the best solution
 
     res = ss.get("res")
+
+    # Distinct near-optimal layouts from the solution pool, when we have a solve.
+    sols = (res.get("solutions")
+            if res and res.get("status") in ("optimal", "incumbent") else None)
+
+    # Layout selector: a toggle directly above the plot, below the time-limit
+    # row. Shown only when the pool returned more than one distinct layout.
+    # Switching it re-renders the chosen layout — it never re-solves.
+    sel_idx = 0
+    if sols and len(sols) > 1:
+        with toggle_slot.container():
+            # Center the selector on the Time limit control (so #3 lands under
+            # "30 s") while keeping it wide enough that the five buttons stay on
+            # one row. A 3-column split whose middle is centered ≈ under Time
+            # limit; the selector stretches to fill that middle column.
+            _pad_l, _mid, _pad_r = st.columns([2.2, 3.0, 4.1])
+            with _mid:
+                choice = st.segmented_control(
+                    "Solution",
+                    options=list(range(len(sols))),
+                    format_func=lambda k: f"#{k + 1}",
+                    key="sol_sel",
+                    width="stretch",
+                )
+        if choice is not None:
+            sel_idx = max(0, min(int(choice), len(sols) - 1))
+    else:
+        # No selector to show (preview or a single layout). Reserve its vertical
+        # space so the plot stays at the same height as when the selector is
+        # present — no jump between the unsolved preview and a solved result.
+        toggle_slot.markdown(
+            "<div style='height:3.25rem'></div>", unsafe_allow_html=True
+        )
+
+    # Rendered view = the selected pooled layout over the solve-level fields
+    # (status / gap / elapsed). Falls back to res for the preview/error paths.
+    sel = {**res, **sols[sel_idx]} if sols else res
 
     with viz_slot.container():
         if res is None:
             st.altair_chart(build_layout_chart(_preview_res(ss)),
                             use_container_width=False)
         elif res["status"] in ("optimal", "incumbent"):
-            st.altair_chart(build_layout_chart(res), use_container_width=False)
+            st.altair_chart(build_layout_chart(sel), use_container_width=False)
         elif res["status"] == "no_feasible":
             st.error("Hit the time limit before finding any feasible layout. "
                      "Try fewer objects, a smaller minimum distance, or a "
                      "longer time limit.")
         elif res["status"] == "infeasible":
-            st.error("Infeasible — an object may be longer than the rack "
+            st.error("Infeasible. An object may be longer than the rack "
                      "(every object must fit within the rack's length), or the "
                      "minimum separation is too large. Try shortening objects, "
                      "lengthening the rack, or reducing the distance.")
         elif res["status"] == "license_busy":
-            st.error(res.get("message", "Gurobi license busy — try again."))
+            st.error(res.get("message", "Gurobi license busy. Try again."))
         elif res["status"] == "solver_missing":
             st.error(res.get("message", "Solver not available."))
         else:
@@ -1198,9 +1363,13 @@ def render_optimizer(ss):
 
     has = res is not None and res["status"] in ("optimal", "incumbent")
     if has:
-        l_f, w_f = res["facility"]
-        facL, facW = f"{l_f:.1f}", f"{w_f:.1f}"
-        pipe = f"{res['pipe_cost']:.2f}"
+        w_f = sel["facility"][1]
+        # Positions are integer in practice (integer dims + separation), so the
+        # objective, facility size, and piping cost are integers up to solver
+        # round-off — show them as whole numbers.
+        objv = f"{sel['obj']:.0f}"
+        facW = f"{w_f:.0f}"
+        pipe = f"{sel['pipe_cost']:.0f}"
         if res["status"] == "optimal":
             gap = "0%"
         elif res.get("gap") is not None:
@@ -1210,13 +1379,13 @@ def render_optimizer(ss):
         elapsed = res.get("elapsed")
         tstr = f"{elapsed:.1f}s" if elapsed is not None else "—"
     else:
-        facL = facW = pipe = gap = tstr = "—"
+        objv = facW = pipe = gap = tstr = "—"
 
-    _render_metric(facL_slot, "Facility length", facL)
-    _render_metric(facW_slot, "Facility width", facW)
-    _render_metric(pipe_slot, "Total piping cost", pipe)
-    _render_metric(gap_slot, "Gap", gap)
-    _render_metric(time_slot, "Total time", tstr)
+    _render_metric(top[4], "Objective", objv)
+    _render_metric(top[5], "Facility width", facW)
+    _render_metric(top[6], "Total piping cost", pipe)
+    _render_metric(top[7], "Gap", gap)
+    _render_metric(top[8], "Total time", tstr)
 
 
 def render_formulation():
@@ -1227,7 +1396,7 @@ def render_formulation():
         _img_col, _ = st.columns(2)
         with _img_col:
             st.image(str(img_path),
-                     caption="Plant facility layout — block placement schematic.",
+                     caption="Block placement schematic for the facility layout.",
                      use_container_width=True)
 
     st.markdown(r"""
@@ -1246,28 +1415,25 @@ along $x$):
 
 $$l_f \ge y_i + l_i, \quad w_f \ge x_i + w_i \quad \forall \, i \in N$$
 
-The pipe **rack** (object 1) spans the facility length — pinned at the
+The pipe **rack** (object 1) spans the facility length. It is pinned at the
 origin with the facility length fixed to the rack's, so every other object
 fits within $[0, l_1]$ and sits to either side of the rack:
 
 $$y_1 = 0, \qquad l_f = l_1$$
 
-The rectilinear edge gaps are defined by always-on constraints:
+The rectilinear edge gaps are defined by always-on constraints (outside the
+disjunction), one lower bound per axis direction:
 
-$$dx_{ij} \ge x_i - (x_j + w_j), \qquad dx_{ij} \ge x_j - (x_i + w_i)$$
-$$dy_{ij} \ge y_i - (y_j + l_j), \qquad dy_{ij} \ge y_j - (y_i + l_i)$$
+$$dx_{ij} \ge x_i - (x_j + w_j), \quad dx_{ij} \ge x_j - (x_i + w_i)$$
 
-with worst-case position bounds $x_i, y_i \le \mathrm{UB}$ where
-$\mathrm{UB} = \sum_i \max(l_i, w_i)$, plus the **non-overlap disjunction**
-(one of four geometric arrangements per pair) and the **rotation
-disjunction** (default vs. 90° rotated, when rotation is enabled; the rack
-stays fixed).
+$$dy_{ij} \ge y_i - (y_j + l_j), \quad dy_{ij} \ge y_j - (y_i + l_i)$$
 
-Since $dx_{ij}, dy_{ij}$ are minimized and bounded below by both signed
-gaps, each settles to the true clearance (0 when the objects overlap on
-that axis). Defining them *outside* the disjunction keeps the objective
-independent of which spatial relation is chosen — the disjunction's only
-job is non-overlap.
+All decision variables are nonnegative ($x_i, y_i, l_i, w_i, l_f, w_f,
+dx_{ij}, dy_{ij} \ge 0$). Positions also have worst-case upper bounds
+$x_i, y_i \le \mathrm{UB} = \sum_i \max(l_i, w_i)$. The model has the
+**non-overlap disjunction** (one of four geometric arrangements per pair)
+and the **rotation disjunction** (default vs. 90° rotated, when rotation is
+enabled; the rack stays fixed).
 
 ### Disjunctions
 
@@ -1275,9 +1441,9 @@ For every pair $(i, j)$ with $j < i$, one of the four separations must
 hold, with the minimum clearance $d_{ij}$ built in:
 
 $$
-\begin{bmatrix} Y_{ij}^1 \\ x_i + w_i + d_{ij} \le x_j \end{bmatrix}
+\begin{bmatrix} Y_{ij}^1 \\ x_i + w_i + d_{ij} \le x_j \\ y_i + l_i \ge y_j - (d_{ij}-1) \\ y_j + l_j \ge y_i - (d_{ij}-1) \end{bmatrix}
 \lor
-\begin{bmatrix} Y_{ij}^2 \\ x_j + w_j + d_{ij} \le x_i \end{bmatrix}
+\begin{bmatrix} Y_{ij}^2 \\ x_j + w_j + d_{ij} \le x_i \\ y_i + l_i \ge y_j - (d_{ij}-1) \\ y_j + l_j \ge y_i - (d_{ij}-1) \end{bmatrix}
 \lor
 \begin{bmatrix} Y_{ij}^3 \\ y_i + l_i + d_{ij} \le y_j \end{bmatrix}
 \lor
@@ -1285,6 +1451,16 @@ $$
 $$
 
 ($k=1$ left, $2$ right, $3$ below, $4$ above.)
+
+The left/right disjuncts ($Y^1, Y^2$) carry two extra inequalities that
+force the two blocks to overlap vertically within $d_{ij}-1$. This is a
+**degeneracy breaking constraint** (the $d$-aware form of Trespalacios &
+Grossmann [5]).
+Without it, a pair separated on *both* axes could be encoded as left/right
+**or** above/below, so one physical layout has several encodings that
+branch-and-bound re-explores. Forcing vertical overlap routes those pairs
+uniquely through above/below, giving one encoding per layout. It is
+optimum-preserving and valid because $d_{ij}$ is integer.
 
 When rotation is enabled, each block additionally chooses orientation:
 
@@ -1306,17 +1482,26 @@ the LP relaxation.
 
 ### Solution method
 
-We reformulate the GDP into a MILP with the **Big-M** transformation —
-one indicator per disjunct with a big constant — then solve it with
-**Gurobi**. With the single-inequality disjuncts above, Big-M keeps the
-model compact; the Hull (convex-hull) transformation was benchmarked too,
-but it disaggregates every variable per disjunct, inflating the model for
-a tighter relaxation that doesn't pay off here.
+We reformulate the GDP into a MILP with the **Big-M** transformation (one
+indicator per disjunct with a big constant), then solve it with **Gurobi**.
+With the single-inequality disjuncts above, Big-M keeps the model compact.
+The Hull (convex-hull) transformation was benchmarked too, but it
+disaggregates every variable per disjunct, inflating the model for a tighter
+relaxation that doesn't pay off here.
 
-For larger instances (n > 8) the MIP can exceed the wall-clock
-time limit; the app then loads the **best feasible incumbent** found
-before the cutoff and reports the optimality gap. Try smaller
-min-separation distances if the solver returns infeasible.
+For larger instances (n > 8) the MIP can exceed the wall-clock time limit.
+The app then loads the **best feasible incumbent** found before the cutoff
+and reports the optimality gap. Try smaller min-separation distances if the
+solver returns infeasible.
+
+Many near-optimal layouts usually exist, and an engineer may prefer one over
+another for reasons the model doesn't capture. After solving, the app asks
+Gurobi's **solution pool** for its best feasible layouts and offers several
+as selectable alternatives. The degeneracy breaking constraint above is what
+makes these genuinely distinct *layouts* rather than duplicate encodings of
+one. From the pool the app greedily selects a spread of layouts. Each new one
+maximizes, against those already chosen, the number of block pairs that take
+a different spatial relation. The lowest-cost layout stays the default.
 
 ### References
 
@@ -1338,9 +1523,14 @@ Solving Linear Generalized Disjunctive Programming Problems,"
 
 [4] M. L. Bynum, G. A. Hackebeil, W. E. Hart, C. D. Laird,
 B. L. Nicholson, J. D. Siirola, J.-P. Watson, and D. L. Woodruff,
-*Pyomo — Optimization Modeling in Python*, 3rd ed. Cham: Springer,
+*Pyomo: Optimization Modeling in Python*, 3rd ed. Cham: Springer,
 2021.
 [Springer](https://link.springer.com/book/10.1007/978-3-030-68928-5)
+
+[5] F. Trespalacios and I. E. Grossmann, "Symmetry breaking for
+generalized disjunctive programming formulation of the strip packing
+problem," *Annals of Operations Research*, vol. 258, pp. 747–759, 2017.
+[Springer](https://link.springer.com/article/10.1007/s10479-016-2112-9)
 """)
 
 
@@ -1382,7 +1572,10 @@ with _caption_col:
         "A pipe **rack** spans the facility; place the other objects on either "
         "side of it to minimize the facility's **width** plus the cost-weighted "
         "Manhattan pipe distance from each object to the rack. Edit the "
-        "objects, set the options, and click **Solve**."
+        "objects, set the options, and click **Solve**. If the time limit is "
+        "reached, the best incumbent solution will be returned, as well as up "
+        "to four other maximally different solutions from Gurobi's solution "
+        "pool."
     )
 
 # ---- Tabs ----
