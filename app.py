@@ -33,10 +33,10 @@
 #   distance into the disjuncts would create.
 #
 # Symmetry breaking:
-#   `sym=1` is hardcoded. The trivial mirror symmetries make the LP
-#   relaxation eight-fold degenerate; pinning block 1 to be "left of and
-#   below" block 2 kills four of the eight equivalences and dramatically
-#   speeds up the MIP. See `sym_1` and `sym_2` in `build_model`.
+#   `sym=1` is hardcoded. Pinning block 1 (the rack) to be "left of" block 2
+#   kills the left/right mirror and speeds up the solve. Only the horizontal
+#   mirror is a symmetry: the top/bottom mirror is broken by each object's fixed
+#   north/south tie-in, so there is no vertical cut. See `sym_1` in `build_model`.
 #
 # Time limit + incumbent handling:
 #   At n=10 the solve can blow past 10 s. We set a wall-clock time limit
@@ -149,7 +149,7 @@ MIN_OBJECTS = 2            # rack + ≥1 object (sym_1/sym_2 reference block 2)
 
 DIM_MIN, DIM_MAX = 1, 9    # editable length / width range
 DIM_RAND_MAX = 3           # Randomize draws dimensions from [1, 3]
-COST_MIN, COST_MAX = 1, 9  # editable pipe-cost-to-rack range (every object pipes to the rack)
+COST_MIN, COST_MAX = 1, 9  # editable pipe-cost range (each object pipes to its assigned rack end)
 COST_RAND_MAX = 3          # Randomize draws costs from [1, 3]
 
 # Weight on the facility bounding box (l_f + w_f) relative to the cost-weighted
@@ -182,19 +182,26 @@ DEFAULT_SEED = 1
 # Categorical palette — each object's index drives BOTH its editor badge color
 # and its block fill in the layout, so the two views stay visually linked
 # (object 1, the rack, gets the first color). Same palette as strip-packing.
+# At least MAX_OBJECTS distinct colors so no two objects ever share one (the
+# index→color map is `_PALETTE[(i-1) % len]`, so the list must be >= the object
+# count to avoid repeats). The first twelve match strip-packing; the rest extend
+# the categorical set out to the 25-object cap.
 _PALETTE = [
     "#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#EECA3B",
     "#B279A2", "#FF9DA6", "#9D755D", "#BAB0AC", "#1F77B4", "#9467BD",
+    "#2CA02C", "#D62728", "#8C564B", "#E377C2", "#17BECF", "#BCBD22",
+    "#AEC7E8", "#FFBB78", "#98DF8A", "#C5B0D5", "#C49C94", "#7F7F7F",
+    "#DBDB8D",
 ]
 
 
 # ── 3. State helpers ──────────────────────────────────────────────────────────
 #
 # The instance is an ordered list of objects. objs[0] is the rack (object 1):
-# every other object has a single pipe cost to the rack, and objects don't
-# connect to each other. Objects carry stable integer ids so per-row editor
-# widgets keep their state across add/delete; length/width/cost map id → value
-# (the rack's cost entry is unused).
+# every other object has a single pipe cost to the rack and a north/south end it
+# ties into, and objects don't connect to each other. Objects carry stable
+# integer ids so per-row editor widgets keep their state across add/delete;
+# length/width/cost/side map id → value (the rack's cost and side are unused).
 
 def _gen_objects(seed, objs):
     """Roll dimensions and pipe costs for the NON-rack objects, leaving the
@@ -210,7 +217,11 @@ def _gen_objects(seed, objs):
         length[oid] = rng.randint(DIM_MIN, DIM_RAND_MAX)
         width[oid] = rng.randint(DIM_MIN, DIM_RAND_MAX)
         cost[oid] = rng.randint(1, COST_RAND_MAX)
-    return objs, length, width, cost
+    # Each non-rack object ties into the north ("N") or south ("S") end of the
+    # rack; the side is fixed instance data. Drawn after the dims/costs so adding
+    # it does not disturb their RNG sequence.
+    side = {oid: rng.choice(["N", "S"]) for oid in objs[1:]}
+    return objs, length, width, cost, side
 
 
 def _default_data():
@@ -225,15 +236,15 @@ def _randomize_data(seed, objs):
 
 
 def _block_label(i):
-    """Display name for block index i: the rack (object 1) reads 'rack', and
+    """Display name for block index i: the rack (object 1) reads 'Rack', and
     every other object is renumbered from 1 (so block 2 → '1', block 3 → '2')."""
-    return "rack" if int(i) == 1 else str(int(i) - 1)
+    return "Rack" if int(i) == 1 else str(int(i) - 1)
 
 
-def _set_data(objs, length, width, cost):
+def _set_data(objs, length, width, cost, side):
     ss = st.session_state
-    ss["objs"], ss["length"], ss["width"], ss["cost"] = (
-        list(objs), dict(length), dict(width), dict(cost)
+    ss["objs"], ss["length"], ss["width"], ss["cost"], ss["side"] = (
+        list(objs), dict(length), dict(width), dict(cost), dict(side)
     )
 
 
@@ -243,6 +254,7 @@ def _init_state():
     ss.setdefault("d_min", D_DEFAULT)
     ss.setdefault("seed", DEFAULT_SEED)
     ss.setdefault("_obj_ver", 0)
+    ss.setdefault("side", {})
     if "objs" not in ss:
         _set_data(*_default_data())
     # Reset / Randomize set a one-shot flag and rerun; we apply it here, before
@@ -267,6 +279,7 @@ def add_object():
     ss["length"] = {**ss["length"], new_id: 2}
     ss["width"] = {**ss["width"], new_id: 2}
     ss["cost"] = {**ss["cost"], new_id: 1}
+    ss["side"] = {**ss["side"], new_id: "N"}
     ss.pop("res", None)
 
 
@@ -277,22 +290,31 @@ def _delete_object(oid):
     if oid == ss["objs"][0] or len(ss["objs"]) <= MIN_OBJECTS:
         return
     ss["objs"] = [i for i in ss["objs"] if i != oid]
-    for key in ("length", "width", "cost"):
+    for key in ("length", "width", "cost", "side"):
         ss[key] = {i: v for i, v in ss[key].items() if i != oid}
     ss.pop("res", None)
 
 
 def _objs_to_inputs(ss):
-    """Map the object list onto build_model's (n, l0, w0, cmat). The cost
-    matrix is a star: object at display position p (≥2) gets its cost-to-rack
-    in cmat[p-1][0]; everything else is zero."""
+    """Map the object list onto build_model's (n, l0, w0, cmat).
+
+    Two implicit tie-in headers are appended after the user objects: a north
+    header (index nu+1) and a south header (nu+2), each zero length and the
+    rack's width, which build_model pins to the rack's top and bottom ends. Each
+    non-rack object's pipe cost goes to its assigned header — north or south per
+    the instance data — rather than to the main rack, whose column stays zero."""
     objs = ss["objs"]
-    n = len(objs)
-    l0 = {p: int(ss["length"][objs[p - 1]]) for p in range(1, n + 1)}
-    w0 = {p: int(ss["width"][objs[p - 1]]) for p in range(1, n + 1)}
+    nu = len(objs)
+    north, south = nu + 1, nu + 2
+    n = nu + 2
+    l0 = {p: int(ss["length"][objs[p - 1]]) for p in range(1, nu + 1)}
+    w0 = {p: int(ss["width"][objs[p - 1]]) for p in range(1, nu + 1)}
+    l0[north] = l0[south] = 0
+    w0[north] = w0[south] = RACK_WID
     cmat = [[0.0] * n for _ in range(n)]
-    for p in range(2, n + 1):
-        cmat[p - 1][0] = float(ss["cost"][objs[p - 1]])
+    for p in range(2, nu + 1):
+        h = north if ss["side"].get(objs[p - 1], "N") == "N" else south
+        cmat[h - 1][p - 1] = float(ss["cost"][objs[p - 1]])
     return n, l0, w0, cmat
 
 
@@ -326,6 +348,16 @@ def build_model(n, l0, w0, cmat, d_uniform, rotate, sym):
     # Pair parameters: pipe cost and minimum required separation.
     c_dict = {(i, j): float(cmat[i - 1][j - 1]) for i, j in m.p}
     d_dict = {(i, j): float(d_uniform) for i, j in m.p}
+    # Tie-in headers (zero-length objects) are virtual pipe targets, not physical
+    # equipment, so they impose no separation: every pair involving a header gets
+    # zero minimum distance. Header–rack needs it (the header sits flush on the
+    # rack's end), and header–object needs it too, otherwise the invisible header
+    # line would push real blocks 1 unit away from the rack's ends.
+    _hdr = {i for i in m.n if l0[i] == 0}
+    if _hdr:
+        for (i, j) in d_dict:
+            if i in _hdr or j in _hdr:
+                d_dict[(i, j)] = 0.0
     m.c = pyo.Param(m.p, initialize=c_dict)
     m.d = pyo.Param(m.p, initialize=d_dict)
 
@@ -362,6 +394,20 @@ def build_model(n, l0, w0, cmat, d_uniform, rotate, sym):
     m.rack_at_origin = pyo.Constraint(expr=m.y[1] == 0)
     m.facility_len_eq_rack = pyo.Constraint(expr=m.l_f == m.l[1])
 
+    # Implicit pipe-rack tie-in headers: each zero-length object is pinned flush
+    # to one end of the main rack and aligned to its x. The lowest-index header
+    # ties to the north (top) end at y = l_f; the next to the south (bottom) end
+    # at y = 0.
+    _headers = sorted(i for i in m.n if l0[i] == 0)
+    if len(_headers) >= 1:
+        _hn = _headers[0]
+        m.pin_north_x = pyo.Constraint(expr=m.x[_hn] == m.x[1])
+        m.pin_north_y = pyo.Constraint(expr=m.y[_hn] == m.l_f)
+    if len(_headers) >= 2:
+        _hs = _headers[1]
+        m.pin_south_x = pyo.Constraint(expr=m.x[_hs] == m.x[1])
+        m.pin_south_y = pyo.Constraint(expr=m.y[_hs] == 0)
+
     # Rectilinear edge gaps, defined GLOBALLY (not inside the disjunction):
     # dx_ij is the horizontal (x/width-axis) clearance between blocks i and j
     # (0 when they overlap in x), dy_ij the vertical (y/length-axis). They're
@@ -384,16 +430,15 @@ def build_model(n, l0, w0, cmat, d_uniform, rotate, sym):
     def dy_lb_b(m, i, j):
         return m.dy[i, j] >= m.y[j] - (m.y[i] + m.l[i])
 
-    # Symmetry breaking: anchor block 1 left-of-and-below block 2's center.
-    # Kills 4 of 8 trivial reflective symmetries; halves the search space.
+    # Symmetry breaking: anchor block 1 left-of block 2's center, killing the
+    # left/right mirror. Only the horizontal mirror is a symmetry here: the
+    # top/bottom mirror is NOT, because flipping y would swap each object's
+    # north/south tie-in, so the old vertical cut (rack-below-block-2) is gone —
+    # it would have wrongly forced block 2 into the upper half.
     if sym == 1:
         @m.Constraint()
         def sym_1(m):
             return m.x[1] + m.w[1] / 2 <= m.x[2] + m.w[2] / 2
-
-        @m.Constraint()
-        def sym_2(m):
-            return m.y[1] + m.l[1] / 2 <= m.y[2] + m.l[2] / 2
 
     # Objective: minimize facility size + Σ pipe-weighted Manhattan distances.
     m.obj = pyo.Objective(
@@ -434,8 +479,9 @@ def build_model(n, l0, w0, cmat, d_uniform, rotate, sym):
     # block can still rotate to recover the transposed layout at the same
     # objective. It also keeps the rack's footprint stable for the viewer.
     if rotate:
-        # Rotation disjunction over the non-rack blocks (2..n) only.
-        _rot_blocks = [i for i in m.n if i != 1]
+        # Rotation disjunction over the real non-rack blocks only. The rack and
+        # the zero-length tie-in headers keep a fixed orientation.
+        _rot_blocks = [i for i in m.n if i != 1 and l0[i] != 0]
 
         @m.Disjunction(_rot_blocks)
         def rotation(m, i):
@@ -444,9 +490,16 @@ def build_model(n, l0, w0, cmat, d_uniform, rotate, sym):
                 [m.l[i] == m.w0[i], m.w[i] == m.l0[i]],   # 90° rotated
             ]
 
-        # Block 1 (rack) is fixed in its default orientation regardless.
-        m.fix_rack_l = pyo.Constraint(expr=m.l[1] == m.l0[1])
-        m.fix_rack_w = pyo.Constraint(expr=m.w[1] == m.w0[1])
+        # Rack and headers keep their default orientation regardless.
+        _fixed = [i for i in m.n if i not in _rot_blocks]
+
+        @m.Constraint(_fixed)
+        def fix_l(m, i):
+            return m.l[i] == m.l0[i]
+
+        @m.Constraint(_fixed)
+        def fix_w(m, i):
+            return m.w[i] == m.w0[i]
     else:
         @m.Constraint(m.n)
         def fix_l(m, i):
@@ -546,6 +599,7 @@ def _extract_layout(m, rotate, l0):
             "l": float(pyo.value(m.l[i])),
             "w": float(pyo.value(m.w[i])),
             "rotated": bool(rotate and abs(float(pyo.value(m.l[i])) - l0[i]) > 1e-6),
+            "is_header": l0[i] == 0,
         })
     pairs = []
     for (i, j) in m.p:
@@ -815,32 +869,105 @@ def build_layout_chart(res):
         "rotated": "yes" if b["rotated"] else "no",
         "connectivity": conn[b["i"]],
         "connected_str": "," + ",".join(str(x) for x in sorted(adj[b["i"]])) + ",",
-        "color": _PALETTE[(int(b["i"]) - 1) % len(_PALETTE)],
-    } for b in blocks])
+        "color": ("#ffffff" if int(b["i"]) == 1
+                  else _PALETTE[(int(b["i"]) - 1) % len(_PALETTE)]),
+    } for b in blocks if not b.get("is_header")])
 
-    # Pipe dataframe — edge-port-routed L-shapes, two segments per pair.
-    # Includes integer i_id/j_id columns so the linked-hover selection can
-    # match against block IDs (the `pair` string is for the tooltip only).
+    # Pipe dataframe — each pipe is an L drawn as two segments: a horizontal
+    # feeder from the object's vertical centre to that object's own lane inside
+    # the rack, then a vertical run along the lane to its north/south end. The
+    # per-object lanes fan the vertical runs across the rack's width so they read
+    # as separate pipes threaded through it. Both legs carry the same cost/color,
+    # so a pipe's stroke width and hue are consistent across the bend. Integer
+    # i_id/j_id columns let the linked-hover selection match block IDs.
+    rack_b = blocks_by_id.get(1)
+    rx = rack_b["x"] if rack_b else 0.0
+    rw = rack_b["w"] if rack_b else 1.0
+    # One evenly-spaced lane inside the rack per object that pipes.
+    _piping_ids = []
+    for p in pairs:
+        if p["c"] <= 0:
+            continue
+        _bi, _bj = blocks_by_id[p["i"]], blocks_by_id[p["j"]]
+        if _bi.get("is_header") or _bj.get("is_header"):
+            _ob = _bj if _bi.get("is_header") else _bi
+            if _ob["i"] not in _piping_ids:
+                _piping_ids.append(_ob["i"])
+    _piping_ids.sort()
+    lane_x = {oid: rx + rw * (k + 1) / (len(_piping_ids) + 1)
+              for k, oid in enumerate(_piping_ids)}
+
+    # Feeders run at each object's vertical centre, but where several objects
+    # share a height their feeders would overlap; fan those into a small band
+    # around the shared height so they read as parallel lines. Objects with a
+    # unique height keep their exact centre.
+    _groups = {}
+    for oid in _piping_ids:
+        ob = blocks_by_id[oid]
+        _groups.setdefault(round(ob["y"] + ob["l"] / 2.0, 2), []).append(oid)
+    feeder_y = {}
+    _STAGGER = 0.22
+    for _yc, _members in _groups.items():
+        _members.sort(key=lambda o: lane_x.get(o, 0.0))
+        _k = len(_members)
+        for _j, _oid in enumerate(_members):
+            _ob = blocks_by_id[_oid]
+            _y = _yc + (_j - (_k - 1) / 2.0) * _STAGGER
+            feeder_y[_oid] = min(max(_y, _ob["y"] + 0.05),
+                                 _ob["y"] + _ob["l"] - 0.05)
+
     max_c = max((p["c"] for p in pairs), default=0.0)
     if max_c > 0:
         pipe_rows = []
         for p in pairs:
             if p["c"] <= 0:
                 continue
-            seg_a, seg_b = _pipe_segments(blocks_by_id[p["i"]], blocks_by_id[p["j"]])
-            pair_label = f"{_block_label(p['i'])}—{_block_label(p['j'])}"
+            bi, bj = blocks_by_id[p["i"]], blocks_by_id[p["j"]]
+            if bi.get("is_header") or bj.get("is_header"):
+                obj_b = bj if bi.get("is_header") else bi
+                hdr = bi if bi.get("is_header") else bj
+                obj_id = int(obj_b["i"])
+                # Start at the object's vertical centre, on its rack-facing edge;
+                # feed horizontally to the object's lane, then run vertically
+                # through the rack along that lane to the assigned end.
+                y_c = feeder_y.get(obj_id, obj_b["y"] + obj_b["l"] / 2.0)
+                edge_x = (obj_b["x"] if obj_b["x"] >= rx + rw
+                          else obj_b["x"] + obj_b["w"])
+                lx = lane_x.get(obj_id, rx + rw / 2.0)
+                y_end = hdr["y"]                       # l_f (north) or 0 (south)
+                seg_a = {"x": edge_x, "y": y_c, "x2": lx, "y2": y_c}
+                seg_b = {"x": lx, "y": y_c, "x2": lx, "y2": y_end}
+                feeder_len = abs(edge_x - lx)
+                direction = "North" if hdr["y"] > l_f / 2 else "South"
+                pair_label = f"{_block_label(obj_id)} → {direction}"
+            else:
+                seg_a, seg_b = _pipe_segments(bi, bj)
+                feeder_len = 0.0
+                pair_label = f"{_block_label(p['i'])}—{_block_label(p['j'])}"
+                obj_id = int(p["i"])
+            # Pipe takes its object's block color, so each line ties back to the
+            # object it serves (same index→color mapping as the block fill).
+            pipe_color = _PALETTE[(obj_id - 1) % len(_PALETTE)]
             for seg in (seg_a, seg_b):
                 pipe_rows.append({
                     **seg,
-                    "c": p["c"],
+                    "c": p["c"],                       # per-unit pipe price
+                    "length": p["dx"] + p["dy"],       # Manhattan pipe length
                     "pair": pair_label,
+                    "color": pipe_color,
+                    "feeder_len": feeder_len,
                     "i_id": int(p["i"]),
                     "j_id": int(p["j"]),
                 })
-        df_pipes = pd.DataFrame(pipe_rows)
+        # Draw longest feeders first so shorter feeders land on top where they
+        # overlap (later rows paint over earlier ones).
+        df_pipes = pd.DataFrame(pipe_rows).sort_values(
+            "feeder_len", ascending=False, kind="mergesort"
+        )
     else:
         df_pipes = pd.DataFrame(
-            columns=["x", "y", "x2", "y2", "c", "pair", "i_id", "j_id"]
+            columns=["x", "y", "x2", "y2", "c", "length", "pair", "color",
+                     "feeder_len", "i_id", "j_id"]
         )
 
     # Domain spans with padding so nothing clips at the edges. Width is the
@@ -969,15 +1096,19 @@ def build_layout_chart(res):
     # transparent wider rule that captures the hover event and shows the
     # tooltip. Decoupling them lets us keep pipes visually thin while
     # giving the cursor a more forgiving hit zone.
-    layers = [facility_box]
+    #
+    # Layer order: box, blocks, THEN pipes, then labels. Pipes draw on top of
+    # the block rectangles so the run alongside the rack (the vertical leg sits
+    # exactly on the rack's edge) is visible instead of being painted over by
+    # the rack. Block-id labels stay on top of everything.
+    layers = [facility_box, block_rects]
     if has_pipes:
-        visible_pipes = alt.Chart(df_pipes).mark_rule(
-            stroke="#dc2626",
-        ).encode(
+        visible_pipes = alt.Chart(df_pipes).mark_rule().encode(
             x=alt.X("x:Q", title="x"), y=alt.Y("y:Q", title="y"),
             x2="x2:Q", y2="y2:Q",
+            stroke=alt.Color("color:N", scale=None, legend=None),
             size=alt.Size("c:Q",
-                          scale=alt.Scale(range=[0.5, 4]),
+                          scale=alt.Scale(range=[1.5, 5]),
                           legend=None),
             opacity=alt.condition(pipe_opacity_expr, alt.value(0.9), alt.value(0.25)),
         )
@@ -988,12 +1119,13 @@ def build_layout_chart(res):
             x=alt.X("x:Q", title="x"), y=alt.Y("y:Q", title="y"),
             x2="x2:Q", y2="y2:Q",
             tooltip=[
-                alt.Tooltip("pair:N", title="Pair (i—j)"),
-                alt.Tooltip("c:Q", format=".0f", title="Pipe cost"),
+                alt.Tooltip("pair:N", title="Pipe"),
+                alt.Tooltip("length:Q", format=".1f", title="Pipe length"),
+                alt.Tooltip("c:Q", format=".0f", title="Pipe price"),
             ],
         ).add_params(hover)
         layers.append(alt.layer(visible_pipes, pipe_hit_targets))
-    layers.extend([block_rects, block_labels])
+    layers.append(block_labels)
 
     # "Not Solved" badge on the initialization preview so the unsolved state
     # reads at a glance. Fixed-pixel placement (top-centre) is independent of
@@ -1050,6 +1182,15 @@ def _render_metric(slot, label, value):
     )
 
 
+def _keep_side_selected(key, oid):
+    """on_change for the per-row N/S segmented control. A single-select
+    segmented control deselects (value → None) when its active option is
+    re-clicked; revert to the object's current side so every row always shows
+    one arrow."""
+    if st.session_state.get(key) is None:
+        st.session_state[key] = st.session_state["side"].get(oid, "N")
+
+
 def _render_object_editor(ss):
     """Inline object editor (left column of the Optimizer tab): one row per
     object with Length / Width / pipe-cost-to-rack steppers. Object 1 is the
@@ -1058,12 +1199,17 @@ def _render_object_editor(ss):
     st.markdown(f"#### Objects (max {MAX_OBJECTS})")
 
     ver = ss["_obj_ver"]
-    cols_spec = [0.5, 1.2, 1.2, 1.2, 0.6]
+    # Original five columns at their original widths, plus a slim arrow column
+    # for the north/south tie-in. The editor pane is a touch wider (see
+    # render_optimizer) so the number columns stay wide enough to keep their
+    # +/- steppers; the fields themselves keep the original 6.5rem cap.
+    cols_spec = [0.5, 1.2, 1.2, 1.2, 0.5, 0.6]
 
     header = st.columns(cols_spec)
     header[1].markdown("**Length**")
     header[2].markdown("**Width**")
-    header[3].markdown("**Pipe cost**")
+    header[3].markdown("**Pipe price**")
+    header[4].markdown("**Pipe to**")
 
     objs = ss["objs"]
     n = len(objs)
@@ -1081,13 +1227,17 @@ def _render_object_editor(ss):
         c = st.columns(cols_spec, vertical_alignment="center")
         # Colored badge: the rack reads "rack" (a wider pill); the others are
         # numbered from 1. Color keys off the block index so the badge always
-        # matches that object's fill in the layout.
+        # matches that object's fill in the layout — including the rack, which
+        # is drawn white (so it needs dark text and a border to stay legible).
         _badge_w = "padding:0 0.45rem;" if is_rack else "width:1.6rem;"
+        _badge_bg = "#ffffff" if is_rack else color
+        _badge_fg = "#1f2937" if is_rack else "#fff"
+        _badge_bd = "border:1px solid #cbd5e1;" if is_rack else ""
         c[0].markdown(
             f'<div style="display:inline-flex;align-items:center;'
             f'justify-content:center;{_badge_w}height:1.6rem;'
-            f'border-radius:0.3rem;background:{color};color:#fff;'
-            f'font-weight:700;font-size:0.85rem;white-space:nowrap;">'
+            f'border-radius:0.3rem;background:{_badge_bg};color:{_badge_fg};'
+            f'{_badge_bd}font-weight:700;font-size:0.85rem;white-space:nowrap;">'
             f'{_block_label(idx)}</div>',
             unsafe_allow_html=True,
         )
@@ -1102,21 +1252,33 @@ def _render_object_editor(ss):
             label_visibility="collapsed",
         )
         new_c = ss["cost"].get(oid, 0)
+        new_side = ss["side"].get(oid, "N")
         if not is_rack:               # rack has no pipe-cost cell (left blank)
             new_c = c[3].number_input(
                 "Pipe cost", min_value=COST_MIN, max_value=COST_MAX, step=1,
                 value=int(ss["cost"][oid]), key=f"cost_{oid}_{ver}",
                 label_visibility="collapsed",
             )
+            new_side = c[4].segmented_control(
+                "Pipe to", options=["N", "S"],
+                format_func=lambda s: "↑" if s == "N" else "↓",
+                default=ss["side"].get(oid, "N"),
+                key=f"side_{oid}_{ver}", label_visibility="collapsed",
+                on_change=_keep_side_selected, args=(f"side_{oid}_{ver}", oid),
+            )
+            if new_side is None:      # deselect guard (also handled in on_change)
+                new_side = ss["side"].get(oid, "N")
         if not is_rack and n > MIN_OBJECTS:
-            c[4].button("🗑", key=f"del_{oid}_{ver}",
+            c[5].button("🗑", key=f"del_{oid}_{ver}",
                         on_click=_delete_object, args=(oid,))
         if (new_l != ss["length"][oid] or new_w != ss["width"][oid]
-                or (not is_rack and new_c != ss["cost"][oid])):
+                or (not is_rack and new_c != ss["cost"][oid])
+                or (not is_rack and new_side != ss["side"].get(oid))):
             ss["length"] = {**ss["length"], oid: new_l}
             ss["width"] = {**ss["width"], oid: new_w}
             if not is_rack:
                 ss["cost"] = {**ss["cost"], oid: new_c}
+                ss["side"] = {**ss["side"], oid: new_side}
             changed = True
 
     if changed:
@@ -1203,6 +1365,13 @@ def render_optimizer(ss):
         div[role="radiogroup"] label {
             margin-right: 0 !important;
         }
+        /* Compact the per-row N/S segmented control so its two arrow segments
+           sit side by side in the slim arrow column instead of wrapping. */
+        [data-testid="stButtonGroup"] { gap: 0.15rem !important; }
+        [data-testid="stButtonGroup"] button {
+            padding: 0.2rem 0.3rem !important;
+            min-width: 0 !important;
+        }
         [data-testid="stNumberInputContainer"] input {
             padding-top: 0.25rem; padding-bottom: 0.25rem;
             text-align: right; padding-right: 0.4rem;
@@ -1231,7 +1400,7 @@ def render_optimizer(ss):
         """,
         unsafe_allow_html=True,
     )
-    editor_col, viz_col = st.columns([3.5, 8.5])
+    editor_col, viz_col = st.columns([4, 8])
 
     with editor_col:
         _render_object_editor(ss)
@@ -1390,21 +1559,14 @@ def _viz_panel(ss):
 
 def render_formulation():
     img_path = Path(__file__).parent / "images" / "formulation.png"
-    if img_path.exists():
-        # Render at ~half width via a half-width column; the PNG is high-res,
-        # so it just downscales and stays crisp.
-        _img_col, _ = st.columns(2)
-        with _img_col:
-            st.image(str(img_path),
-                     caption="Block placement schematic for the facility layout.",
-                     use_container_width=True)
 
     st.markdown(r"""
-### Optimal control problem
+### Layout Formulation
 
 Place $n$ rectangular objects so that the facility's bounding-box
-dimensions plus the cost-weighted Manhattan pipe distances to the rack are
-minimized. Width is the horizontal ($x$) axis, length the vertical ($y$):
+dimensions plus the cost-weighted Manhattan pipe distance from each object to
+its assigned north or south end of the rack are minimized. Width is the
+horizontal ($x$) axis, length the vertical ($y$):
 
 $$\min \; \lambda \,(l_f + w_f) + \sum_{i,j \in N,\; j<i} c_{ij} \big( dx_{ij} + dy_{ij} \big)$$
 
@@ -1420,6 +1582,14 @@ origin with the facility length fixed to the rack's, so every other object
 fits within $[0, l_1]$ and sits to either side of the rack:
 
 $$y_1 = 0, \qquad l_f = l_1$$
+
+Each non-rack object is assigned (as fixed instance data) to tie into the
+**north** end ($y = l_f$) or the **south** end ($y = 0$) of the rack, and its
+piping cost is the Manhattan distance to that end. This is modeled with two
+zero-length tie-in objects pinned to the rack's top and bottom, sharing the
+rack's $x$-span, at zero clearance, so the same distance and non-overlap
+machinery applies; the $c_{ij}$ above are then nonzero only between an object
+and its assigned end.
 
 The rectilinear edge gaps are defined by always-on constraints (outside the
 disjunction), one lower bound per axis direction:
@@ -1469,16 +1639,27 @@ $$
 \;\lor\;
 \begin{bmatrix} Y_i^6 \\ l_i = w_i^0 \\ w_i = l_i^0 \end{bmatrix}
 $$
+""")
 
+    if img_path.exists():
+        # Half-width column so the high-res PNG downscales and stays crisp.
+        _img_col, _ = st.columns(2)
+        with _img_col:
+            st.image(str(img_path), use_container_width=True,
+                     caption="Nonoverlap disjunction, i is left of j, when dyᵢⱼ < dᵢⱼ")
+
+    st.markdown(r"""
 ### Symmetry breaking
 
-The trivial mirror symmetries make the LP relaxation eight-fold
-degenerate. We anchor block 1 to be left-of-and-below block 2's center:
+Only the left/right mirror is a symmetry here: flipping top/bottom would swap
+each object's north/south tie-in, so it is not one. We anchor block 1 (the
+rack) left of block 2's center:
 
-$$x_1 + w_1/2 \le x_2 + w_2/2 \qquad y_1 + l_1/2 \le y_2 + l_2/2$$
+$$x_1 + w_1/2 \le x_2 + w_2/2$$
 
-This kills four of eight reflective equivalences and noticeably tightens
-the LP relaxation.
+This removes the left/right reflective pair and tightens the LP relaxation. A
+vertical anchor is deliberately omitted: under the fixed north/south
+assignment it would wrongly exclude valid layouts.
 
 ### Solution method
 
@@ -1569,13 +1750,13 @@ st.markdown(
 _caption_col, _ = st.columns([6, 3])
 with _caption_col:
     st.markdown(
-        "A pipe **rack** spans the facility; place the other objects on either "
-        "side of it to minimize the facility's **width** plus the cost-weighted "
-        "Manhattan pipe distance from each object to the rack. Edit the "
-        "objects, set the options, and click **Solve**. If the time limit is "
-        "reached, the best incumbent solution will be returned, as well as up "
-        "to four other maximally different solutions from Gurobi's solution "
-        "pool. For reference, the optimal objective for the default instance is 77."
+        "A pipe **rack** spans the facility; place unit ops on either side of "
+        "it to minimize piping cost to the north and south sides of the pipe "
+        "rack. Edit the objects, set the options, and click **Solve**. If the "
+        "time limit is reached, the best incumbent solution will be returned, "
+        "as well as up to four other maximally different solutions from "
+        "Gurobi's solution pool. For reference, the optimal objective for the "
+        "default instance is 98."
     )
 
 # ---- Tabs ----
